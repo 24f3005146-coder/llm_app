@@ -1,338 +1,229 @@
 // server.js
 
-// Load environment variables immediately
-require('dotenv').config();
-
-// --- Core Libraries ---
 const express = require('express');
 const axios = require('axios');
-const path = require('path');
-const fs = require('fs');
-const os = require('os'); // Required for os.tmpdir()
+const { Octokit } = require("@octokit/rest");
+const OpenAI = require('openai');
+const { Buffer } = require('buffer'); // Required for Base64 encoding for GitHub API
 
-// GitHub API client
-const { Octokit } = require('octokit');
-
-// For running command-line tools (like git)
-const { spawn } = require('child_process');
-
-// --- LLM Integration ---
-const { OpenAI } = require('openai');
-
-// --- Configuration ---
-const app = express();
-// Cloud platforms will often set the PORT environment variable automatically
-const port = process.env.PORT || process.env.API_PORT || 3000;
-
-// Initialize Octokit with your PAT
+// --- INITIALIZATION ---
+// Initialize API Clients using environment variables
 const octokit = new Octokit({ auth: process.env.GITHUB_PAT });
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY }); 
 
-// Initialize the OpenAI Client
-// The SDK automatically uses OPENAI_API_KEY from the environment
-const openai = new OpenAI({});
+// Configuration from Environment Variables
+const GITHUB_OWNER = process.env.GITHUB_USERNAME; 
 
-// Get secrets from .env (will be loaded from the cloud environment for deployment)
-const STUDENT_SECRET = process.env.STUDENT_SECRET;
-const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
-const GITHUB_PAT = process.env.GITHUB_PAT; // Used for CLI authentication
+const app = express();
+app.use(express.json()); 
 
-// Tell Express to parse incoming JSON bodies (with a large limit for attachments)
-app.use(express.json({ limit: '50mb' }));
 
-// --- Server Startup ---
-app.listen(port, () => {
-    console.log(`LLM Deployer API running on port ${port}`);
-    console.log(`Ready to receive tasks...`);
-});
+// --- HELPER FUNCTIONS ---
 
-// =====================================================================
-// == 1. Main Deployment Endpoint ==
-// =====================================================================
+/**
+ * 1. Generates the necessary files (HTML, README, LICENSE) using the OpenAI API.
+ * Uses JSON mode for reliable structured output.
+ */
+async function generateFiles(brief, attachments) {
+    const attachment_info = attachments.map(a => 
+        `Attachment: ${a.name}, Type: ${a.url.substring(5, a.url.indexOf(';'))}`
+    ).join('\n');
 
-app.post('/api-endpoint', async (req, res) => {
-    const taskData = req.body;
+    const systemPrompt = `You are an expert web developer and documentation writer. Based on the brief, generate a complete, working, single-page web application (HTML/JS/CSS). The application must be fully contained in 'index.html'. Also generate a professional 'README.md' and the standard 'MIT LICENSE' text. Your response MUST be a single JSON object.`;
 
-    // 1. Basic Verification Check
-    if (taskData.secret !== STUDENT_SECRET) {
-        console.error(`ERROR: Invalid secret provided for task ${taskData.task}`);
-        return res.status(401).json({ error: 'Invalid student secret.' });
-    }
+    const userPrompt = `
+        APPLICATION BRIEF: "${brief}"
+        ATTACHMENTS: ${attachment_info}
+        
+        If the brief is for Round 2, treat it as a modification request for the existing code.
+    `;
 
-    // 2. CRITICAL: Send HTTP 200 Response Immediately
-    // This acknowledges receipt and prevents the sender from timing out.
-    res.status(200).json({ message: `Request for task ${taskData.task}, round ${taskData.round} received. Processing in background.` });
+    const responseSchema = {
+        type: "object",
+        properties: {
+            html_content: { type: "string", description: "The complete HTML file content for the app." },
+            readme_content: { type: "string", description: "A professional, complete README.md content." },
+            license_content: { type: "string", description: "The full, standard MIT License text." }
+        },
+        required: ["html_content", "readme_content", "license_content"]
+    };
 
-    // 3. Process the task in the background (asynchronously)
-    processTask(taskData).catch(err => {
-        // Log any critical errors that occur after the 200 response has been sent
-        console.error(`FATAL ERROR processing task ${taskData.task}:`, err.message, err.stack);
+    const response = await openai.chat.completions.create({
+        model: "gpt-4o", 
+        messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: userPrompt }
+        ],
+        response_format: { type: "json_object" },
+        temperature: 0.1 
     });
-});
 
-// =====================================================================
-// == 2. Core Orchestration Logic ==
-// =====================================================================
-
-async function processTask(data) {
-    const { email, task, round, nonce, brief, checks, evaluation_url } = data;
-    
-    // Repository details generation
-    const repoName = `${task}-${round}`;
-    const repoURL = `https://github.com/${GITHUB_USERNAME}/${repoName}`;
-    const pagesURL = `https://${GITHUB_USERNAME}.github.io/${repoName}/`;
-    
-    console.log(`\n--- Starting execution for ${repoName} (Round ${round}) ---`);
-
-    try {
-        // A. Generate the Code using the LLM
-        const files = await generateAppCode(data);
-        
-        // B. Create/Update Repo and Push
-        const commitSHA = await commitToGitHub(repoName, files, brief, round);
-        
-        // C. Enable GitHub Pages (Only required for Round 1 setup)
-        if (round === 1) {
-            await enableGitHubPages(repoName);
-        }
-        
-        // D. Notify the Evaluator
-        await pingEvaluationAPI({ email, task, round, nonce, repo_url: repoURL, commit_sha: commitSHA, pages_url: pagesURL, evaluation_url });
-
-        console.log(`SUCCESS: Task ${repoName} completed and evaluation ping sent.`);
-
-    } catch (error) {
-        console.error(`FAILURE: Deployment failed for ${repoName}. Details:`, error.message);
-    }
-}
-
-// =====================================================================
-// == 3. LLM and Code Generation Functions ==
-// =====================================================================
-
-// Helper to decode a data URI attachment (used for text snippets)
-function decodeAttachment(attachment) {
-    const base64Data = attachment.url.split(',')[1];
-    return Buffer.from(base64Data, 'base64');
+    const jsonText = response.choices[0].message.content;
+    return JSON.parse(jsonText);
 }
 
 /**
- * Uses the OpenAI API (gpt-4o) to generate required files in JSON format.
+ * 2. Creates the repository, pushes files, and enables GitHub Pages.
+ * Handles both creation (Round 1) and file update (Round 2).
  */
-async function generateAppCode(data) {
-    const { brief, checks, attachments } = data;
-    console.log("Generating code with OpenAI LLM (gpt-4o)...");
-
-    // 1. Prepare the detailed prompt for the LLM
-    let prompt = `You are a specialized code generator for a GitHub Pages deployment. 
-    Your task is to create a complete, minimal, single-page application that meets the following requirements. 
-    The application must be self-contained in index.html, using only client-side JavaScript.
+async function createAndPushRepo(octokit, owner, repoName, files, round) {
+    const defaultBranch = 'main';
+    let commit_sha = '';
     
-    REQUIREMENTS (BRIEF): ${brief}
-    EVALUATION CHECKS: \n- ${checks.join('\n- ')}
-    
-    OUTPUT FORMAT: Return a single JSON object where keys are file names (e.g., 'index.html', 'README.md', 'LICENSE') and values are the file content as string values.
-    
-    REQUIRED FILES:
-    - index.html (The main application file, including all HTML, CSS, and JS)
-    - README.md (Must be professional: summary, setup, usage, code explanation, license)
-    - LICENSE (Must contain the full MIT License text)
-    `;
-
-    // 2. Prepare content for the API call (handles text and vision inputs)
-    const messages = [
-        {
-            role: "user",
-            content: [
-                { type: "text", text: prompt }
-            ]
-        }
-    ];
-
-    // Add attachments (especially images) to the message content
-    attachments.forEach(att => {
-        if (att.url.startsWith('data:image/')) {
-            messages[0].content.push({
-                type: "image_url",
-                image_url: { url: att.url }
-            });
-        } else {
-            // For non-image data URIs, include a text snippet for context
-            const contentSnippet = decodeAttachment(att).toString('utf-8').slice(0, 500) + '... (truncated)';
-            messages[0].content.push({
-                type: "text",
-                text: `Attachment ${att.name} snippet: ${contentSnippet}`
-            });
-        }
-    });
-
-    // 3. Make the API call
-    const response = await openai.chat.completions.create({
-        model: 'gpt-4o', 
-        messages: messages,
-        response_format: { type: "json_object" }, 
-        temperature: 0.1, 
-    });
-
-    // 4. Process the response
-    const jsonString = response.choices[0].message.content.trim();
-    
-    try {
-        const files = JSON.parse(jsonString);
+    // --- Round 1: Create Repo and Push Initial Files ---
+    if (round === 1) {
+        console.log(`Round 1: Creating new repository ${repoName}...`);
         
-        // Basic validation of the required files
-        if (!files['index.html'] || !files['README.md'] || !files['LICENSE']) {
-            throw new Error("LLM did not return all required files: index.html, README.md, and LICENSE.");
-        }
+        await octokit.repos.createForAuthenticatedUser({
+            name: repoName,
+            private: false, // Must be public
+        });
         
-        console.log("OpenAI code generation complete.");
-        return files;
+        // Push initial files sequentially (simplest Octokit method)
+        const filesToCommit = [
+            { path: 'LICENSE', content: files.license_content, message: 'feat: Add MIT License' },
+            { path: 'README.md', content: files.readme_content, message: 'feat: Initial README' },
+            { path: 'index.html', content: files.html_content, message: 'feat: Initial application code (Round 1)' },
+        ];
+        
+        for (const file of filesToCommit) {
+            const commitResponse = await octokit.repos.createOrUpdateFileContents({
+                owner,
+                repo: repoName,
+                path: file.path,
+                message: file.message,
+                content: Buffer.from(file.content, 'utf8').toString('base64'),
+                branch: defaultBranch
+            });
+            commit_sha = commitResponse.data.commit.sha;
+        }
 
-    } catch (e) {
-        console.error("Failed to parse LLM response into JSON or missing required files.");
-        console.error("Raw LLM Response:", jsonString.substring(0, 500) + '...');
-        throw new Error(`Code generation failed: ${e.message}`);
-    }
-}
-
-// =====================================================================
-// == 4. GitHub & Git CLI Functions ==
-// =====================================================================
-
-// Helper to run local shell commands (like 'git')
-function runCommand(cmd, args, cwd) {
-    return new Promise((resolve, reject) => {
-        const proc = spawn(cmd, args, { cwd });
-        let stdout = '';
-        let stderr = '';
-
-        proc.stdout.on('data', (data) => {
-            stdout += data.toString();
+        // Enable GitHub Pages
+        await octokit.repos.createPagesSite({
+            owner,
+            repo: repoName,
+            source: { branch: defaultBranch, path: '/' },
         });
 
-        proc.stderr.on('data', (data) => {
-            stderr += data.toString();
-        });
+    } 
+    // --- Round 2: Update Existing Files ---
+    else if (round === 2) {
+        console.log(`Round 2: Updating existing repository ${repoName}...`);
+        
+        const filesToUpdate = [
+            { path: 'index.html', content: files.html_content, message: 'refactor: Round 2 application update' },
+            { path: 'README.md', content: files.readme_content, message: 'docs: Update README for Round 2 features' },
+        ];
 
-        proc.on('close', (code) => {
-            if (code !== 0) {
-                reject(new Error(`'${cmd} ${args.join(' ')}' failed with code ${code}. STDOUT: ${stdout}. STDERR: ${stderr}`));
-            } else {
-                resolve(stdout);
-            }
-        });
-    });
-}
-
-async function commitToGitHub(repoName, files, brief, round) {
-    // Use a temporary directory based on the task name
-    const tempDir = path.join(os.tmpdir(), 'llm_task_temp', repoName);
-    // Use the PAT for HTTPS authentication in the git URL
-    const repoURL = `https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${repoName}.git`;
-
-    try {
-        // A. Create Repository (Round 1 only)
-        if (round === 1) {
-            console.log(`- Creating new public repository: ${repoName}`);
-            await octokit.repos.createForAuthenticatedUser({
-                name: repoName,
-                description: `LLM-generated app for task ${repoName}`,
-                private: false, // Must be public for GitHub Pages
+        for (const file of filesToUpdate) {
+             // Get the SHA of the current file to reference it in the update
+            const { data: { sha: currentSha } } = await octokit.repos.getContent({
+                owner,
+                repo: repoName,
+                path: file.path,
+                ref: defaultBranch,
             });
-        }
-        
-        // B. Prepare Local Directory
-        fs.mkdirSync(tempDir, { recursive: true });
-        
-        // Write the generated files
-        for (const [fileName, content] of Object.entries(files)) {
-            // Write contents to the temp directory
-            fs.writeFileSync(path.join(tempDir, fileName), content);
-        }
 
-        // C. Run Git Commands (CLI)
-        console.log("- Running Git commands (init, commit, push)...");
-
-        // 1. Initialize Git and link to remote
-        await runCommand('git', ['init'], tempDir);
-        await runCommand('git', ['remote', 'add', 'origin', repoURL], tempDir);
-        
-        // 2. Configure identity (required for commit)
-        await runCommand('git', ['config', 'user.email', `${GITHUB_USERNAME}@users.noreply.github.com`], tempDir);
-        await runCommand('git', ['config', 'user.name', GITHUB_USERNAME], tempDir);
-        
-        // 3. Add, Commit, and Push
-        await runCommand('git', ['add', '.'], tempDir);
-        const commitMessage = `Round ${round} submission: ${brief.substring(0, 100).trim()}...`;
-        await runCommand('git', ['commit', '-m', commitMessage], tempDir);
-        await runCommand('git', ['branch', '-M', 'main'], tempDir);
-        
-        // Push the changes
-        await runCommand('git', ['push', '-u', 'origin', 'main'], tempDir);
-
-        // 4. Get the Commit SHA
-        const commitSHA = (await runCommand('git', ['rev-parse', 'HEAD'], tempDir)).trim();
-        
-        console.log(`- New Commit SHA: ${commitSHA}`);
-        return commitSHA;
-
-    } finally {
-        // D. Cleanup: Remove the temporary directory
-        if (fs.existsSync(tempDir)) {
-            console.log("- Cleaning up temporary directory.");
-            fs.rmSync(tempDir, { recursive: true, force: true });
+            const commitResponse = await octokit.repos.createOrUpdateFileContents({
+                owner,
+                repo: repoName,
+                path: file.path,
+                message: file.message,
+                content: Buffer.from(file.content, 'utf8').toString('base64'),
+                sha: currentSha, // Required for updating existing files
+                branch: defaultBranch
+            });
+            commit_sha = commitResponse.data.commit.sha;
         }
     }
-}
 
-async function enableGitHubPages(repoName) {
-    console.log(`- Enabling GitHub Pages for ${repoName}...`);
+    const repo_url = `https://github.com/${owner}/${repoName}`;
+    const pages_url = `https://${owner}.github.io/${repoName}/`; 
     
-    // This API call configures Pages to serve from the 'main' branch
-    await octokit.repos.createPagesDeployment({
-        owner: GITHUB_USERNAME,
-        repo: repoName,
-        source: {
-            branch: 'main',
-            path: '/', // root directory of the branch
-        },
-    });
-    console.log(`- GitHub Pages setup complete. URL: https://${GITHUB_USERNAME}.github.io/${repoName}/`);
+    return { repo_url, commit_sha, pages_url };
 }
 
-// =====================================================================
-// == 5. Evaluation Notification Function ==
-// =====================================================================
+/**
+ * 3. Sends the final notification to the evaluation API with mandatory retry logic.
+ */
+async function sendNotification(axios, payload, evaluationUrl) {
+    let delay = 1000; // 1 second
+    const MAX_RETRIES = 5; 
 
-async function pingEvaluationAPI({ email, task, round, nonce, repo_url, commit_sha, pages_url, evaluation_url }) {
-    const payload = { email, task, round, nonce, repo_url, commit_sha, pages_url };
-    // Exponential backoff delays: 1, 2, 4, 8, 16, 32 seconds
-    const delayTimes = [1000, 2000, 4000, 8000, 16000, 32000]; 
-
-    for (let i = 0; i < delayTimes.length; i++) {
-        const delay = delayTimes[i];
+    for (let i = 0; i < MAX_RETRIES; i++) {
         try {
-            console.log(`- Attempting to ping evaluation URL: ${evaluation_url} (Attempt ${i + 1})`);
-            
-            const response = await axios.post(evaluation_url, payload, {
-                headers: { 'Content-Type': 'application/json' },
-                timeout: 10000 // 10 second timeout for the ping
+            console.log(`Submitting evaluation data (Attempt ${i + 1})...`);
+            await axios.post(evaluationUrl, payload, {
+                headers: { 'Content-Type': 'application/json' }
             });
-
-            if (response.status === 200) {
-                console.log('--- Evaluation ping successful! ---');
-                return; // Success, exit the retry loop
-            }
-            
-            // Log non-200 responses and continue to retry
-            console.warn(`- Ping received non-200 status: ${response.status}. Retrying...`);
-            
+            console.log("Notification successful! ✅");
+            return; 
         } catch (error) {
-            // Check for timeout or connection errors
-            console.warn(`- Ping failed (retrying in ${delay / 1000}s): ${error.message.substring(0, 80)}...`);
-            // Wait for the specified delay before the next attempt
+            console.warn(`Notification failed. Retrying in ${delay / 1000}s...`);
             await new Promise(resolve => setTimeout(resolve, delay));
+            delay *= 2; 
         }
     }
-    // If we exit the loop, all retries failed
-    throw new Error('Final evaluation ping failed after all retries. The task may not be evaluated.');
+    throw new Error("Failed to send final notification after all retries.");
 }
+
+
+/**
+ * 4. The Orchestrator: Main background function to process the request.
+ */
+async function processTask(requestBody) {
+    const { email, task, round, nonce, brief, evaluation_url, attachments } = requestBody;
+    // Create a unique repo name based on the task ID
+    const repoName = `llm-deploy-${task.toLowerCase().replace(/[^a-z0-9]/g, '-')}`; 
+    
+    try {
+        // Step 1: LLM Code Generation
+        const files = await generateFiles(brief, attachments);
+        
+        // Step 2: GitHub Repository Operations (Create or Update)
+        const { repo_url, commit_sha, pages_url } = await createAndPushRepo(
+            octokit, GITHUB_OWNER, repoName, files, round
+        );
+
+        // Step 3: Final Notification
+        const notificationPayload = { email, task, round, nonce, repo_url, commit_sha, pages_url };
+        await sendNotification(axios, notificationPayload, evaluation_url);
+
+        console.log(`Task ${task} (Round ${round}) complete. Pages URL: ${pages_url}`);
+
+    } catch (error) {
+        console.error(`--- CRITICAL FAILURE for Task ${task} (Round ${round}) ---`);
+        console.error("Error details:", error.message || error);
+        // Do not re-submit to evaluation_url on failure, as required by the spec.
+    }
+}
+
+
+// --- EXPRESS ROUTE HANDLER ---
+
+// Your main API endpoint
+app.post('/', async (req, res) => {
+    // 1. Authenticate
+    const studentSecret = process.env.STUDENT_SECRET;
+    if (req.body.secret !== studentSecret) {
+        return res.status(401).json({ error: 'Invalid secret value.' });
+    }
+
+    // 2. Immediate Response
+    res.status(200).json({ success: true, message: 'Request accepted. Processing in background.' });
+
+    // 3. Start Asynchronous Background Processing
+    processTask(req.body).catch(err => {
+        console.error(`FATAL ERROR in processTask background thread:`, err);
+    });
+});
+
+
+// --- SERVER START ---
+
+// Use the PORT provided by Render
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`Server is running on port ${PORT}`);
+    console.log(`Ready to receive requests at ${process.env.RENDER_EXTERNAL_URL || 'http://localhost:' + PORT}`);
+});
