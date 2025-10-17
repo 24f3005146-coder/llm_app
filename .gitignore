@@ -1,0 +1,12 @@
+# Dependencies and logs
+node_modules/
+npm-debug.log
+
+# Environment variables (MUST BE EXCLUDED)
+.env
+
+# Temporary repository created by the script
+temp_repo/
+
+# Common OS files
+.DS_Store
