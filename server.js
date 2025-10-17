@@ -8,6 +8,7 @@ const express = require('express');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
+const os = require('os'); // Required for os.tmpdir()
 
 // GitHub API client
 const { Octokit } = require('octokit');
@@ -15,14 +16,22 @@ const { Octokit } = require('octokit');
 // For running command-line tools (like git)
 const { spawn } = require('child_process');
 
+// --- LLM Integration ---
+const { OpenAI } = require('openai');
+
 // --- Configuration ---
 const app = express();
-const port = process.env.API_PORT || 3000;
+// Cloud platforms will often set the PORT environment variable automatically
+const port = process.env.PORT || process.env.API_PORT || 3000;
 
 // Initialize Octokit with your PAT
 const octokit = new Octokit({ auth: process.env.GITHUB_PAT });
 
-// Get secrets from .env
+// Initialize the OpenAI Client
+// The SDK automatically uses OPENAI_API_KEY from the environment
+const openai = new OpenAI({});
+
+// Get secrets from .env (will be loaded from the cloud environment for deployment)
 const STUDENT_SECRET = process.env.STUDENT_SECRET;
 const GITHUB_USERNAME = process.env.GITHUB_USERNAME;
 const GITHUB_PAT = process.env.GITHUB_PAT; // Used for CLI authentication
@@ -50,11 +59,13 @@ app.post('/api-endpoint', async (req, res) => {
     }
 
     // 2. CRITICAL: Send HTTP 200 Response Immediately
+    // This acknowledges receipt and prevents the sender from timing out.
     res.status(200).json({ message: `Request for task ${taskData.task}, round ${taskData.round} received. Processing in background.` });
 
-    // 3. Process the task in the background
+    // 3. Process the task in the background (asynchronously)
     processTask(taskData).catch(err => {
-        console.error(`FATAL ERROR processing task ${taskData.task}:`, err.message);
+        // Log any critical errors that occur after the 200 response has been sent
+        console.error(`FATAL ERROR processing task ${taskData.task}:`, err.message, err.stack);
     });
 });
 
@@ -65,7 +76,7 @@ app.post('/api-endpoint', async (req, res) => {
 async function processTask(data) {
     const { email, task, round, nonce, brief, checks, evaluation_url } = data;
     
-    // Repository details
+    // Repository details generation
     const repoName = `${task}-${round}`;
     const repoURL = `https://github.com/${GITHUB_USERNAME}/${repoName}`;
     const pagesURL = `https://${GITHUB_USERNAME}.github.io/${repoName}/`;
@@ -73,13 +84,13 @@ async function processTask(data) {
     console.log(`\n--- Starting execution for ${repoName} (Round ${round}) ---`);
 
     try {
-        // A. Generate the Code
+        // A. Generate the Code using the LLM
         const files = await generateAppCode(data);
         
         // B. Create/Update Repo and Push
         const commitSHA = await commitToGitHub(repoName, files, brief, round);
         
-        // C. Enable GitHub Pages (Only required for Round 1 to initialize hosting)
+        // C. Enable GitHub Pages (Only required for Round 1 setup)
         if (round === 1) {
             await enableGitHubPages(repoName);
         }
@@ -98,18 +109,18 @@ async function processTask(data) {
 // == 3. LLM and Code Generation Functions ==
 // =====================================================================
 
-// Helper to decode a data URI attachment
+// Helper to decode a data URI attachment (used for text snippets)
 function decodeAttachment(attachment) {
     const base64Data = attachment.url.split(',')[1];
     return Buffer.from(base64Data, 'base64');
 }
 
 /**
- * !!! IMPORTANT: REPLACE MOCK BLOCK WITH REAL LLM API CALL !!!
+ * Uses the OpenAI API (gpt-4o) to generate required files in JSON format.
  */
 async function generateAppCode(data) {
     const { brief, checks, attachments } = data;
-    console.log("Generating code with LLM...");
+    console.log("Generating code with OpenAI LLM (gpt-4o)...");
 
     // 1. Prepare the detailed prompt for the LLM
     let prompt = `You are a specialized code generator for a GitHub Pages deployment. 
@@ -119,52 +130,68 @@ async function generateAppCode(data) {
     REQUIREMENTS (BRIEF): ${brief}
     EVALUATION CHECKS: \n- ${checks.join('\n- ')}
     
-    OUTPUT FORMAT: Return a single JSON object with the file names as keys and the file content as string values.
+    OUTPUT FORMAT: Return a single JSON object where keys are file names (e.g., 'index.html', 'README.md', 'LICENSE') and values are the file content as string values.
     
     REQUIRED FILES:
-    - index.html (The main application file)
+    - index.html (The main application file, including all HTML, CSS, and JS)
     - README.md (Must be professional: summary, setup, usage, code explanation, license)
     - LICENSE (Must contain the full MIT License text)
-    
-    ATTACHMENT DATA (Included for context and use in the app):
     `;
-    
+
+    // 2. Prepare content for the API call (handles text and vision inputs)
+    const messages = [
+        {
+            role: "user",
+            content: [
+                { type: "text", text: prompt }
+            ]
+        }
+    ];
+
+    // Add attachments (especially images) to the message content
     attachments.forEach(att => {
-        // Decode and truncate for the prompt (to save tokens)
-        const contentSnippet = decodeAttachment(att).toString('utf-8').slice(0, 500) + '... (truncated)';
-        prompt += `\n- File Name: ${att.name}, Type: ${att.url.split(';')[0]}, Content Snippet:\n${contentSnippet}\n`;
+        if (att.url.startsWith('data:image/')) {
+            messages[0].content.push({
+                type: "image_url",
+                image_url: { url: att.url }
+            });
+        } else {
+            // For non-image data URIs, include a text snippet for context
+            const contentSnippet = decodeAttachment(att).toString('utf-8').slice(0, 500) + '... (truncated)';
+            messages[0].content.push({
+                type: "text",
+                text: `Attachment ${att.name} snippet: ${contentSnippet}`
+            });
+        }
     });
-    
-    // ----------------------------------------------------------------
-    // !!! START OF MOCK BLOCK - REPLACE THIS !!!
-    // ----------------------------------------------------------------
 
-    console.warn("WARNING: Using MOCK code generation. You MUST replace this with your real LLM call (e.g., Gemini API).");
-    await new Promise(resolve => setTimeout(resolve, 2000)); // Simulate LLM latency
+    // 3. Make the API call
+    const response = await openai.chat.completions.create({
+        model: 'gpt-4o', 
+        messages: messages,
+        response_format: { type: "json_object" }, 
+        temperature: 0.1, 
+    });
 
-    return {
-        'index.html': `
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="UTF-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                <title>LLM Task: ${data.task}</title>
-            </head>
-            <body>
-                <h1>Application for Task: ${data.task}</h1>
-                <p>Status: Code generated successfully for round ${data.round}.</p>
-                <p>Brief: ${brief}</p>
-                </body>
-            </html>
-        `,
-        'README.md': `# ${data.task}\n\n## Summary\nThis application was generated by an LLM to fulfill the brief: "${brief}".\n\n## Setup\nNo setup required; deployable via GitHub Pages.\n\n## Code Explanation\nThe core logic is self-contained in index.html to handle the requested functionality.\n\n## License\nMIT License.\n`,
-        'LICENSE': 'MIT License\n\nCopyright (c) 2024 Your Name\n\nPermission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.\n', 
-    };
+    // 4. Process the response
+    const jsonString = response.choices[0].message.content.trim();
     
-    // ----------------------------------------------------------------
-    // !!! END OF MOCK BLOCK !!!
-    // ----------------------------------------------------------------
+    try {
+        const files = JSON.parse(jsonString);
+        
+        // Basic validation of the required files
+        if (!files['index.html'] || !files['README.md'] || !files['LICENSE']) {
+            throw new Error("LLM did not return all required files: index.html, README.md, and LICENSE.");
+        }
+        
+        console.log("OpenAI code generation complete.");
+        return files;
+
+    } catch (e) {
+        console.error("Failed to parse LLM response into JSON or missing required files.");
+        console.error("Raw LLM Response:", jsonString.substring(0, 500) + '...');
+        throw new Error(`Code generation failed: ${e.message}`);
+    }
 }
 
 // =====================================================================
@@ -197,7 +224,9 @@ function runCommand(cmd, args, cwd) {
 }
 
 async function commitToGitHub(repoName, files, brief, round) {
-    const tempDir = path.join(__dirname, 'temp_repo', repoName);
+    // Use a temporary directory based on the task name
+    const tempDir = path.join(os.tmpdir(), 'llm_task_temp', repoName);
+    // Use the PAT for HTTPS authentication in the git URL
     const repoURL = `https://${GITHUB_USERNAME}:${GITHUB_PAT}@github.com/${GITHUB_USERNAME}/${repoName}.git`;
 
     try {
@@ -207,7 +236,7 @@ async function commitToGitHub(repoName, files, brief, round) {
             await octokit.repos.createForAuthenticatedUser({
                 name: repoName,
                 description: `LLM-generated app for task ${repoName}`,
-                private: false,
+                private: false, // Must be public for GitHub Pages
             });
         }
         
@@ -216,7 +245,7 @@ async function commitToGitHub(repoName, files, brief, round) {
         
         // Write the generated files
         for (const [fileName, content] of Object.entries(files)) {
-            // Write binary data for attachments if needed, but here we assume all are text files
+            // Write contents to the temp directory
             fs.writeFileSync(path.join(tempDir, fileName), content);
         }
 
@@ -233,7 +262,7 @@ async function commitToGitHub(repoName, files, brief, round) {
         
         // 3. Add, Commit, and Push
         await runCommand('git', ['add', '.'], tempDir);
-        const commitMessage = `Round ${round} update: ${brief.substring(0, 100).trim()}...`;
+        const commitMessage = `Round ${round} submission: ${brief.substring(0, 100).trim()}...`;
         await runCommand('git', ['commit', '-m', commitMessage], tempDir);
         await runCommand('git', ['branch', '-M', 'main'], tempDir);
         
@@ -247,10 +276,10 @@ async function commitToGitHub(repoName, files, brief, round) {
         return commitSHA;
 
     } finally {
-        // D. Cleanup
+        // D. Cleanup: Remove the temporary directory
         if (fs.existsSync(tempDir)) {
             console.log("- Cleaning up temporary directory.");
-            fs.rmSync(path.join(__dirname, 'temp_repo'), { recursive: true, force: true });
+            fs.rmSync(tempDir, { recursive: true, force: true });
         }
     }
 }
@@ -267,7 +296,7 @@ async function enableGitHubPages(repoName) {
             path: '/', // root directory of the branch
         },
     });
-    console.log(`- GitHub Pages setup complete.`);
+    console.log(`- GitHub Pages setup complete. URL: https://${GITHUB_USERNAME}.github.io/${repoName}/`);
 }
 
 // =====================================================================
@@ -276,7 +305,7 @@ async function enableGitHubPages(repoName) {
 
 async function pingEvaluationAPI({ email, task, round, nonce, repo_url, commit_sha, pages_url, evaluation_url }) {
     const payload = { email, task, round, nonce, repo_url, commit_sha, pages_url };
-    // The required delays: 1, 2, 4, 8, 16, 32... seconds (in milliseconds)
+    // Exponential backoff delays: 1, 2, 4, 8, 16, 32 seconds
     const delayTimes = [1000, 2000, 4000, 8000, 16000, 32000]; 
 
     for (let i = 0; i < delayTimes.length; i++) {
@@ -286,7 +315,7 @@ async function pingEvaluationAPI({ email, task, round, nonce, repo_url, commit_s
             
             const response = await axios.post(evaluation_url, payload, {
                 headers: { 'Content-Type': 'application/json' },
-                timeout: 5000 // Set a reasonable timeout
+                timeout: 10000 // 10 second timeout for the ping
             });
 
             if (response.status === 200) {
@@ -298,11 +327,12 @@ async function pingEvaluationAPI({ email, task, round, nonce, repo_url, commit_s
             console.warn(`- Ping received non-200 status: ${response.status}. Retrying...`);
             
         } catch (error) {
+            // Check for timeout or connection errors
             console.warn(`- Ping failed (retrying in ${delay / 1000}s): ${error.message.substring(0, 80)}...`);
             // Wait for the specified delay before the next attempt
             await new Promise(resolve => setTimeout(resolve, delay));
         }
     }
     // If we exit the loop, all retries failed
-    throw new Error('Final evaluation ping failed after all retries.');
+    throw new Error('Final evaluation ping failed after all retries. The task may not be evaluated.');
 }
