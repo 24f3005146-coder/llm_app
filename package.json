@@ -20,6 +20,7 @@
     "@google/genai": "^1.25.0",
     "@octokit/rest": "^22.0.0",
     "axios": "^1.12.2",
+    "simple-git": "^3.24.0",
     "dotenv": "^16.6.1",
     "express": "^4.21.2",
     "octokit": "^4.0.0",
