@@ -177,8 +177,10 @@ async function processTask(requestBody) {
     const repoName = `llm-deploy-${task.toLowerCase().replace(/[^a-z0-9]/g, '-')}`; 
     
     try {
+	console.log(`Starting Round ${round} processing for: ${repoName}`);
         // Step 1: LLM Code Generation
         const files = await generateFiles(brief, attachments);
+	console.log(`DEBUG: Files generated successfully. HTML length: ${files.html_content.length}`);
         
         // Step 2: GitHub Repository Operations (Create or Update)
         const { repo_url, commit_sha, pages_url } = await createAndPushRepo(
