@@ -17,6 +17,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google/genai": "^1.25.0",
     "@octokit/rest": "^22.0.0",
     "axios": "^1.12.2",
     "dotenv": "^16.6.1",

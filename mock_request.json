@@ -1,0 +1,11 @@
+{
+  "secret": "Varun-Secret-Tennis",
+  "email": "24f3005146@ds.study.iitm.ac.in",
+  "task": "Integration-Test-Round-1",
+  "round": 1,
+  "nonce": "test-nonce-123",
+  "brief": "Create a simple web page with a blue background and white text that says 'API Deployed Successfully'.",
+  "checks": [],
+  "evaluation_url": "https://httpbin.org/post",
+  "attachments": []
+}
